@@ -4,9 +4,9 @@
 
 A **NixOS module** that runs [Dokploy](https://dokploy.com/) (a self-hosted PaaS / deployment platform) using declarative systemd units.
 
-⚠️ This module is **NixOS-only**. It integrates directly with `systemd.services` and `systemd.tmpfiles`, so it will not work on nix-darwin, home-manager, or plain nixpkgs environments.
+This module is **NixOS-only**. It integrates directly with `systemd.services` and `systemd.tmpfiles`, so it will not work on nix-darwin, home-manager, or plain nixpkgs environments.
 
-## ✨ Features
+## Features
 
 - `dokploy-stack.service` and `dokploy-traefik.service` systemd units
 - Proper service ordering (`docker.service` → `dokploy-stack.service` → `dokploy-traefik.service`)
@@ -18,13 +18,13 @@ A **NixOS module** that runs [Dokploy](https://dokploy.com/) (a self-hosted PaaS
 ![Service Status](./Readme/systemctl-status-dokploy.png)
 ![Docker Stack](./Readme/docker-stack-ps-dokploy.png)
 
-## 📋 Requirements
+## Requirements
 
 - Docker must be enabled
 - Docker live-restore must be disabled (required for swarm)
 - Rootless Docker is not supported (swarm limitation)
 
-## 🚀 Quick Start
+## Quick Start
 
 Add to your `flake.nix`:
 
@@ -46,6 +46,7 @@ Add to your `flake.nix`:
 
           # Enable Dokploy
           services.dokploy.enable = true;
+          services.dokploy.database.passwordFile = "/var/lib/secrets/dokploy-db-password";
         }
       ];
     };
@@ -53,19 +54,31 @@ Add to your `flake.nix`:
 }
 ```
 
-That's it! Dokploy will be available at `http://your-server-ip:3000`
+Generate a password file on the host before deploying:
 
-## ⚙️ Configuration Options
+```bash
+mkdir -p /var/lib/secrets
+openssl rand -base64 32 > /var/lib/secrets/dokploy-db-password
+```
+
+Dokploy will be available at `http://your-server-ip:3000`
+
+## Configuration Options
 
 ### Basic Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `services.dokploy.dataDir` | `/var/lib/dokploy` | Data directory for Dokploy |
-| `services.dokploy.image` | `dokploy/dokploy:v0.25.11` | Dokploy Docker image |
-| `services.dokploy.port` | `"3000:3000"` | Port binding for web UI (⚠️ see note) |
+| `services.dokploy.image` | `dokploy/dokploy:v0.28.4` | Dokploy Docker image |
+| `services.dokploy.port` | `"3000:3000"` | Port binding for web UI (see note) |
+| `services.dokploy.hostPortMode` | `false` | Use "host" port mode instead of "ingress" (bypasses Swarm routing mesh) |
+| `services.dokploy.lxc` | `false` | Enable LXC compatibility (required for Proxmox) |
+| `services.dokploy.database.passwordFile` | — (required) | Path to file containing the PostgreSQL password |
+| `services.dokploy.database.useInsecureHardcodedPassword` | `false` | Use old hardcoded password (migration aid only, see below) |
 | `services.dokploy.environment` | `{}` | Environment variables for Dokploy container |
-| `services.dokploy.traefik.image` | `traefik:v3.6.1` | Traefik Docker image |
+| `services.dokploy.traefik.image` | `traefik:v3.6.7` | Traefik Docker image |
+| `services.dokploy.traefik.extraArgs` | `[]` | Extra `docker run` flags for Traefik container |
 | `services.dokploy.swarm.autoRecreate` | `false` | Auto-recreate swarm when IP change is detected during service restart |
 
 ### Swarm Advertise Address
@@ -118,7 +131,7 @@ For single-node setups (the most common case), the default `"private"` setting s
 
 ### Web UI Port Configuration
 
-⚠️ **Recommendation**: Disable port 3000 once Traefik is configured to reverse proxy Dokploy.
+**Recommendation**: Disable port 3000 once Traefik is configured to reverse proxy Dokploy.
 
 1. Deploy with default port for initial configuration
 2. Access Dokploy UI and configure Traefik reverse proxy
@@ -132,7 +145,86 @@ services.dokploy.port = "3000:3000";
 services.dokploy.port = null;
 ```
 
-## 📄 License
+### Traefik Extra Arguments
+
+Pass extra `docker run` flags to the Traefik container:
+
+```nix
+services.dokploy.traefik.extraArgs = [
+  "-e CF_API_EMAIL=user@example.com"
+  "-e CF_API_KEY=your_api_key"
+  "-v /path/to/certs:/certs"
+];
+```
+
+### Database Password
+
+The PostgreSQL password is stored as a Docker secret. `database.passwordFile` is required and must point to a file containing the password.
+
+```bash
+openssl rand -base64 32 > /var/lib/secrets/dokploy-db-password
+```
+
+```nix
+services.dokploy.database.passwordFile = "/var/lib/secrets/dokploy-db-password";
+```
+
+#### Upgrading from the old hardcoded password
+
+Previous versions used a hardcoded PostgreSQL password. On upgrade, `nixos-rebuild` will fail with an error asking you to either set `database.passwordFile` or enable `database.useInsecureHardcodedPassword`.
+
+**Option A: Keep the old password temporarily**
+
+If you're not ready to migrate, add this to unblock the upgrade:
+
+```nix
+services.dokploy.database.useInsecureHardcodedPassword = true;
+```
+
+This continues using the old hardcoded password. A build warning will remind you to migrate.
+
+**Option B: Migrate to a secure password**
+
+> Complete these steps in order. The old stack must still be running for step 2.
+
+1. Generate a new password file on the host:
+   ```bash
+   openssl rand -base64 32 > /var/lib/secrets/dokploy-db-password
+   ```
+
+2. Change the password in the running PostgreSQL container:
+   ```bash
+   NEW_PW=$(cat /var/lib/secrets/dokploy-db-password)
+   docker exec -e PGPASSWORD=amukds4wi9001583845717ad2 \
+     $(docker ps --filter "name=dokploy_postgres" -q) \
+     psql -U dokploy -d dokploy \
+     -c "ALTER USER dokploy WITH PASSWORD '$NEW_PW'"
+   ```
+
+3. Deploy with `database.passwordFile` set:
+   ```nix
+   services.dokploy.database.passwordFile = "/var/lib/secrets/dokploy-db-password";
+   ```
+
+#### Rotating the password
+
+Docker secrets are immutable, so the deploy script won't update an existing secret. To rotate the password:
+
+1. Change the password in the running PostgreSQL container (same as step 2 of the migration above)
+2. Write the new password to the file at `database.passwordFile`
+3. Remove the stack so the secret is no longer in use: `docker stack rm dokploy`
+4. Remove the old Docker secret: `docker secret rm dokploy_postgres_password`
+5. Redeploy with `nixos-rebuild switch`
+
+#### Recovery
+
+If the password gets into a bad state, you can get a local superuser shell (no password needed):
+
+```bash
+docker exec -it $(docker ps --filter "name=dokploy_postgres" -q) psql -U dokploy -d dokploy
+```
+
+## License
 
 This NixOS module is licensed under the [MIT License](./LICENSE) - use it freely without restrictions.
 

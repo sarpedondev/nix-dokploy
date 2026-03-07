@@ -6,9 +6,33 @@
 }: let
   cfg = config.services.dokploy;
 
+  useSecrets = !cfg.database.useInsecureHardcodedPassword;
+
   stackConfig = import ./dokploy-stack.nix {inherit cfg lib;};
   yamlFormat = pkgs.formats.yaml {};
   stackFile = yamlFormat.generate "dokploy-stack.yml" stackConfig;
+
+  deploySnippet =
+    if useSecrets
+    then ''
+      if [ ! -f "${cfg.database.passwordFile}" ]; then
+        echo "Error: password file not found: ${cfg.database.passwordFile}"
+        exit 1
+      fi
+
+      if ! docker secret inspect dokploy_postgres_password >/dev/null 2>&1; then
+        echo "Creating Docker secret from password file..."
+        docker secret create dokploy_postgres_password "${cfg.database.passwordFile}"
+      fi
+
+      ADVERTISE_ADDR="$advertise_addr" \
+      docker stack deploy -c ${stackFile} --detach=false dokploy
+    ''
+    else lib.warn "nix-dokploy: database.useInsecureHardcodedPassword is enabled. This uses a well-known password from Dokploy's source code. Migrate to database.passwordFile as soon as possible." ''
+      ADVERTISE_ADDR="$advertise_addr" \
+      POSTGRES_PASSWORD="amukds4wi9001583845717ad2" \
+      docker stack deploy -c ${stackFile} --detach=false dokploy
+    '';
 in {
   options.services.dokploy = {
     enable = lib.mkOption {
@@ -24,24 +48,32 @@ in {
     };
 
     database = {
-      password = lib.mkOption {
-        type = lib.types.str;
-        default = "amukds4wi9001583845717ad2";
+      useInsecureHardcodedPassword = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
         description = ''
-          PostgreSQL database password for Dokploy.
-
-          WARNING: This password is hardcoded in Dokploy's source code and cannot be changed
-          without breaking the application. Dokploy does not currently support custom database
-          passwords. This is a known security issue (see Dokploy/dokploy#595).
-
-          The default value matches what Dokploy expects internally.
+          Use the old hardcoded PostgreSQL password from Dokploy's source code.
+          This is insecure and only intended as a temporary migration aid for
+          existing installations. Set database.passwordFile instead.
         '';
+      };
+
+      passwordFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = ''
+          Path to a file containing the PostgreSQL password for Dokploy.
+          The file must be readable by root and will be used as a Docker secret.
+
+          Required unless database.useInsecureHardcodedPassword is enabled.
+        '';
+        example = "/var/lib/secrets/dokploy-db-password";
       };
     };
 
     image = lib.mkOption {
       type = lib.types.str;
-      default = "dokploy/dokploy:v0.25.11";
+      default = "dokploy/dokploy:v0.28.4";
       description = ''
         Dokploy Docker image to use.
       '';
@@ -81,14 +113,43 @@ in {
       '';
     };
 
+    hostPortMode = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Use "host" port publishing mode instead of the default "ingress" mode.
+        Host mode binds ports directly on the host, bypassing the Swarm routing mesh.
+        More efficient for single-node setups.
+      '';
+    };
+
+    lxc = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Enable compatibility mode for LXC containers (e.g. Proxmox).
+        Adds "endpoint_mode: dnsrr" to the Dokploy service deployment configuration.
+        This is required for Docker Swarm networking to work correctly inside LXC.
+      '';
+    };
+
     traefik = {
       image = lib.mkOption {
         type = lib.types.str;
-        default = "traefik:v3.6.1";
+        default = "traefik:v3.6.7";
         description = ''
           Traefik Docker image to use.
           Default matches the version pinned in Dokploy's installation script.
           Changing this may cause compatibility issues with Dokploy.
+        '';
+      };
+
+      extraArgs = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [];
+        description = ''
+          Extra arguments to pass to the Traefik container's docker run command.
+          Can be used to pass environment variables, volumes, etc.
         '';
       };
     };
@@ -175,6 +236,25 @@ in {
       {
         assertion = !config.virtualisation.docker.rootless.enable;
         message = "Dokploy stack does not support rootless Docker";
+      }
+      {
+        assertion = cfg.database.passwordFile != null || cfg.database.useInsecureHardcodedPassword;
+        message = ''
+          Dokploy now uses Docker secrets for the PostgreSQL password.
+          You must set one of:
+
+            services.dokploy.database.passwordFile = "/var/lib/secrets/dokploy-db-password";
+
+          Or, to continue using the old hardcoded password temporarily:
+
+            services.dokploy.database.useInsecureHardcodedPassword = true;
+
+          See the "Database Password" section in the README for migration steps.
+        '';
+      }
+      {
+        assertion = !(cfg.database.passwordFile != null && cfg.database.useInsecureHardcodedPassword);
+        message = "Cannot set both database.passwordFile and database.useInsecureHardcodedPassword";
       }
     ];
 
@@ -276,16 +356,14 @@ in {
                 ''
               }
 
-              ADVERTISE_ADDR="$advertise_addr" \
-              POSTGRES_PASSWORD="${cfg.database.password}" \
-              docker stack deploy -c ${stackFile} dokploy
+              ${deploySnippet}
             '';
           };
         in "${script}/bin/dokploy-stack-start";
 
         ExecStop = let
           script = pkgs.writeShellScript "dokploy-stack-stop" ''
-            ${pkgs.docker}/bin/docker stack rm dokploy || true
+            ${pkgs.docker}/bin/docker stack rm --detach=false dokploy || true
           '';
         in "${script}";
       };
@@ -307,6 +385,18 @@ in {
             name = "dokploy-traefik-start";
             runtimeInputs = [pkgs.docker];
             text = ''
+              echo "Waiting for Dokploy to generate Traefik configuration..."
+              timeout=120
+              while [ ! -f "${cfg.dataDir}/traefik/traefik.yml" ]; do
+                sleep 1
+                timeout=$((timeout - 1))
+                if [ "$timeout" -le 0 ]; then
+                  echo "Error: Timed out waiting for traefik.yml"
+                  exit 1
+                fi
+              done
+              echo "Traefik configuration found."
+
               if docker ps -a --format '{{.Names}}' | grep -q '^dokploy-traefik$'; then
                 echo "Starting existing Traefik container..."
                 docker start dokploy-traefik
@@ -322,7 +412,7 @@ in {
                   -p 80:80/tcp \
                   -p 443:443/tcp \
                   -p 443:443/udp \
-                  ${cfg.traefik.image}
+                  ${lib.concatMapStringsSep " \\\n  " lib.escapeShellArg (cfg.traefik.extraArgs ++ [cfg.traefik.image])}
               fi
             '';
           };
