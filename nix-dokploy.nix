@@ -484,7 +484,7 @@ in {
                   -v /var/run/docker.sock:/var/run/docker.sock \
                   -v ${cfg.dataDir}/traefik/traefik.yml:/etc/traefik/traefik.yml \
                   -v ${cfg.dataDir}/traefik/dynamic:/etc/dokploy/traefik/dynamic \
-                  -p 443:443/udp \
+                  -p 443:443/tcp \
                   ${lib.concatMapStringsSep " \\\n  " lib.escapeShellArg (cfg.traefik.extraArgs ++ [cfg.traefik.image])}
               fi
             '';
